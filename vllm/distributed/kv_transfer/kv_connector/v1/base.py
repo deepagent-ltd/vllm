@@ -85,6 +85,8 @@ CopyBlocksOp = Callable[
 
 logger = init_logger(__name__)
 
+KVConnectorControlHandler = Callable[[str, dict[str, Any]], Any]
+
 
 @dataclass(slots=True)
 class KVConnectorTransferResults:
@@ -227,6 +229,15 @@ class KVConnectorBase_V1(ABC):
         return False, as a dropped save is just a future cache miss.
         """
         return self._kv_transfer_config.is_kv_producer
+
+    def get_control_handler(self, namespace: str) -> KVConnectorControlHandler | None:
+        """Opt in to one native core-thread utility namespace.
+
+        The scheduler-side handler validates its own operations and payloads.
+        It runs synchronously on the EngineCore thread and should return a
+        wire-serializable reply. Use scheduler hooks for subsequent work.
+        """
+        return None
 
     @classmethod
     def supports_sleep_mode(cls, kv_transfer_config: "KVTransferConfig") -> bool:

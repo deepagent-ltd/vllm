@@ -319,3 +319,34 @@ allocator, copy implementation, hot layout, and replacement policy should stay
 platform-specific. NVIDIA uses the current accelerator LRU and fused host/hot
 kernel. Other accelerators can implement `HiSparseBackend` and return its class
 path from their platform override without changing the shared control flow.
+
+### External rank-local host backing
+
+By default HiSparse allocates and registers its own host pool. A deployment
+with TP1, PP1, PCP1 and DCP1 can supply a trusted allocator via
+`kv_connector_extra_config.host_pool_allocator` on `HiSparseConnector`,
+including when that connector is nested in `MultiConnector`. The same
+`host_pool_gib` config sizes the scheduler pool.
+
+vLLM resolves the Python callable by qualified name in the GPU worker. It
+calls the allocator once per engine lifetime with keyword arguments
+`instance_id`, `dp_rank` and page-rounded `size_bytes`. Return a
+`vllm.v1.hisparse.runtime.HiSparseHostMemoryLease` containing a contiguous
+one-dimensional CPU `torch.int8` tensor of exactly that size and a no-argument
+release callback. The buffer must start at a host page boundary and must be
+safe to register. Allocation may fail before the worker starts accepting
+requests.
+
+The worker owns exclusive use of that buffer and registers it for DMA. It
+returns the lease after GPU synchronization, unregister and cache detachment.
+An unregister or release failure retains the lease for a safe retry or
+process cleanup. The release callback must be idempotent, and live views must
+keep the allocation exclusive until their last storage alias expires.
+This interface grants backing for one DP owner. The scheduler continues owning
+all block IDs, free lists and readiness.
+
+### Worker lifecycle hooks
+
+Engine owners that use timed lifecycle RPCs need a collective executor
+advertising `supports_timed_collective_rpc`. Executors without that
+capability reject activation of these hooks.

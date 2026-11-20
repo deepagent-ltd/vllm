@@ -14,6 +14,7 @@ from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
 from logging import DEBUG
+from math import isfinite
 from multiprocessing.queues import Queue
 from typing import Any, TypeVar, cast, get_args
 
@@ -72,7 +73,11 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
     update_kv_cache_capacity,
 )
-from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.interface import (
+    PauseState,
+    SchedulerInterface,
+    SynchronousStepCallback,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
@@ -128,6 +133,10 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 
 class EngineCore:
     """Inner loop of vLLM's Engine."""
+
+    _synchronous_step_callback: SynchronousStepCallback | None = None
+    _synchronous_step_scope: tuple[int, object] | None = None
+    _owner_worker_controls_bound: bool = False
 
     def __init__(
         self,
@@ -269,10 +278,13 @@ class EngineCore:
         self.prefill_schedule_interval = scheduler_config.prefill_schedule_interval
         # Steps that scheduled tokens; empty schedule() calls don't count.
         self.num_executed_steps = 0
+        self._configure_synchronous_step_callback()
 
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
+        self._run_worker_startup_callback()
+        self._bind_owner_worker_controls()
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -705,6 +717,116 @@ class EngineCore:
         interval = self.prefill_schedule_interval
         return interval > 1 and self.num_executed_steps % interval != 0
 
+    def _configure_synchronous_step_callback(self) -> None:
+        # External schedulers may implement the previous interface by duck typing.
+        get_callback = getattr(self.scheduler, "get_synchronous_step_callback", None)
+        if get_callback is None:
+            return
+        callback = get_callback()
+        if callback is None:
+            return
+        if not callable(callback):
+            raise TypeError("Synchronous scheduler step callback must be callable.")
+        if self.async_scheduling is not False or self.batch_queue is not None:
+            raise ValueError(
+                "A synchronous scheduler step callback requires synchronous "
+                "scheduling and exactly one in-flight batch."
+            )
+        if not getattr(self.model_executor, "supports_timed_collective_rpc", False):
+            raise ValueError(
+                "A synchronous scheduler step callback requires an executor "
+                "with timed worker RPC."
+            )
+        self._synchronous_step_callback = callback
+
+    def _run_worker_startup_callback(self) -> None:
+        get_callback = getattr(self.scheduler, "get_worker_startup_callback", None)
+        callback = None if get_callback is None else get_callback()
+        if callback is None:
+            return
+        if not callable(callback):
+            raise TypeError("Scheduler worker startup callback must be callable.")
+        if not getattr(self.model_executor, "supports_timed_collective_rpc", False):
+            raise ValueError("Scheduler worker startup requires timed worker RPC.")
+        scope = object()
+        self._synchronous_step_scope = (threading.get_ident(), scope)
+        try:
+            callback(partial(self._synchronous_step_rpc, scope))
+        finally:
+            self._synchronous_step_scope = None
+
+    def _synchronous_step_rpc(
+        self,
+        scope: object,
+        method: str,
+        *,
+        timeout: float,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        if self._synchronous_step_scope != (threading.get_ident(), scope):
+            raise RuntimeError(
+                "Worker RPC is outside its synchronous step callback or startup."
+            )
+        if (
+            not isinstance(method, str)
+            or not method.strip()
+            or type(timeout) not in (int, float)
+            or not isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("Worker RPC requires a named method and finite timeout.")
+        return self.collective_rpc(method, timeout, args, kwargs)
+
+    def _bind_owner_worker_controls(self) -> None:
+        get_registration = getattr(
+            self.scheduler, "get_owner_worker_control_registration", None
+        )
+        registration = None if get_registration is None else get_registration()
+        if registration is None:
+            return
+        methods, bind = registration
+        if (
+            type(methods) is not tuple
+            or not methods
+            or any(
+                type(method) is not str or not method.isidentifier()
+                for method in methods
+            )
+            or len(set(methods)) != len(methods)
+            or not callable(bind)
+        ):
+            raise ValueError("Invalid named worker control registration.")
+        if (
+            self.async_scheduling is not False
+            or self.batch_queue is not None
+            or not getattr(self.model_executor, "supports_timed_collective_rpc", False)
+        ):
+            raise ValueError(
+                "Owner worker controls require synchronous scheduling and timed RPC."
+            )
+        allowed = frozenset(methods)
+        owner_thread = threading.get_ident()
+
+        def call(method, *, timeout, args=(), kwargs=None):
+            if threading.get_ident() != owner_thread:
+                raise RuntimeError("Worker control belongs to the EngineCore owner.")
+            if type(method) is not str or method not in allowed:
+                raise ValueError("Worker control method was not registered.")
+            if self._synchronous_step_scope is not None:
+                raise RuntimeError("Worker control cannot nest a synchronous RPC.")
+            scope = object()
+            self._synchronous_step_scope = (owner_thread, scope)
+            try:
+                return self._synchronous_step_rpc(
+                    scope, method, timeout=timeout, args=args, kwargs=kwargs
+                )
+            finally:
+                self._synchronous_step_scope = None
+
+        bind(call)
+        self._owner_worker_controls_bound = True
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -732,10 +854,23 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        model_executed = scheduler_output.total_num_scheduled_tokens > 0
+        callback = self._synchronous_step_callback
+        if model_executed and callback is not None:
+            scope = object()
+            self._synchronous_step_scope = (threading.get_ident(), scope)
+            try:
+                callback(
+                    scheduler_output,
+                    model_output,
+                    partial(self._synchronous_step_rpc, scope),
+                )
+            finally:
+                self._synchronous_step_scope = None
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
 
-        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+        return engine_core_outputs, model_executed
 
     def _wait_for_output(self, future: Future[Any]) -> Any:
         """Block until a step's model output is ready."""
@@ -1246,6 +1381,29 @@ class EngineCore:
             path=path, pattern=pattern, max_size=max_size
         )
 
+    def kv_connector_control(
+        self, namespace: str, operation: str, payload: dict[str, Any]
+    ) -> Any:
+        """Dispatch an opted-in scheduler connector utility on the core thread."""
+        if (
+            not isinstance(namespace, str)
+            or not namespace.strip()
+            or not isinstance(operation, str)
+            or not operation.strip()
+            or not isinstance(payload, dict)
+            or any(not isinstance(key, str) for key in payload)
+        ):
+            raise ValueError("Invalid KV connector control envelope")
+        if self.batch_queue:
+            raise ValueError("KV connector control requires no in-flight model batches")
+        connector = self.scheduler.get_kv_connector()
+        handler = (
+            None if connector is None else connector.get_control_handler(namespace)
+        )
+        if handler is None:
+            raise ValueError("KV connector control namespace is unavailable")
+        return handler(operation, payload)
+
     def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -1327,6 +1485,12 @@ _INPUTS_HANDLED_DURING_STEP = (
     EngineCoreRequestType.EXECUTOR_FAILED,
     EngineCoreRequestType.WAKEUP,
 )
+# A scheduler with scoped worker controls can call its executor on ADD or
+# ABORT. Those input handlers must wait for the committed step.
+_INPUTS_HANDLED_DURING_OWNER_STEP = (
+    EngineCoreRequestType.EXECUTOR_FAILED,
+    EngineCoreRequestType.WAKEUP,
+)
 # While waiting for a step's output, how long to busy-poll for new inputs
 # before falling back to a blocking wait for the output.
 _INPUT_SPIN_DURATION_S = 1.0
@@ -1337,6 +1501,7 @@ class EngineCoreProc(EngineCore):
 
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
     addresses: EngineZmqAddresses
+    _quiescent_callback: tuple[float, Callable[[], object]] | None = None
 
     @instrument(span_name="EngineCoreProc init")
     def __init__(
@@ -1410,6 +1575,7 @@ class EngineCoreProc(EngineCore):
                 executor_fail_callback,
                 internal_dp_balancing,
             )
+            self._configure_quiescent_callback()
 
             # Initialize fault tolerance settings.
             self.enable_fault_tolerance = (
@@ -1804,6 +1970,19 @@ class EngineCoreProc(EngineCore):
         """Returns true if shutdown has not been requested."""
         return self.shutdown_state == EngineShutdownState.RUNNING
 
+    def _configure_quiescent_callback(self) -> None:
+        get_callback = getattr(self.scheduler, "get_quiescent_callback", None)
+        if get_callback is None or (registration := get_callback()) is None:
+            return
+        interval_ns, callback = registration
+        if (
+            type(interval_ns) is not int
+            or not 1_000_000 <= interval_ns <= threading.TIMEOUT_MAX * 1_000_000_000
+            or not callable(callback)
+        ):
+            raise ValueError("Invalid quiescent scheduler callback or interval.")
+        self._quiescent_callback = (interval_ns / 1_000_000_000, callback)
+
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
@@ -1849,6 +2028,25 @@ class EngineCoreProc(EngineCore):
                     logger.debug("EngineCore waiting for work.")
                     waited = True
             block = self.process_input_queue_block
+            quiescent = self._quiescent_callback
+            if quiescent is not None and (not self.is_running() or self.has_work()):
+                break
+            if block and quiescent is not None and not self.is_scheduler_paused():
+                interval, callback = quiescent
+                try:
+                    with get_watch_dog().disable():
+                        req = self.input_queue.get(timeout=interval)
+                except queue.Empty:
+                    if (
+                        self.is_running()
+                        and not self.has_work()
+                        and not self.is_scheduler_paused()
+                        and self.input_queue.empty()
+                    ):
+                        callback()
+                else:
+                    self._handle_client_request(*req)
+                continue
             try:
                 with get_watch_dog().disable():
                     req = self.input_queue.get(block=block)
@@ -1954,13 +2152,19 @@ class EngineCoreProc(EngineCore):
             future, "wait_briefly", None
         )
         if poll is not None and wait_briefly is not None:
+            allowed_inputs = _INPUTS_HANDLED_DURING_STEP
+            if (
+                self._synchronous_step_callback is not None
+                or self._owner_worker_controls_bound
+            ):
+                allowed_inputs = _INPUTS_HANDLED_DURING_OWNER_STEP
             pending_inputs = self.input_queue.queue
             spin_deadline = time.monotonic() + _INPUT_SPIN_DURATION_S
             while not self._deferred_inputs and not poll():
                 if pending_inputs:
                     req = self.input_queue.get_nowait()
                     # Some kinds of request must wait until the step completes.
-                    if req[0] in _INPUTS_HANDLED_DURING_STEP:
+                    if req[0] in allowed_inputs:
                         self._handle_client_request(*req)
                     else:
                         self._deferred_inputs.append(req)

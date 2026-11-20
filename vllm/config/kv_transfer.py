@@ -13,9 +13,9 @@ KVConsumer = Literal["kv_consumer", "kv_both"]
 KVRole = Literal[KVProducer, KVConsumer]
 
 
-def hisparse_host_pool_gib(
+def hisparse_connector_extra_config(
     kv_transfer_config: "KVTransferConfig | None",
-) -> float | None:
+) -> dict[str, Any] | None:
     if kv_transfer_config is None:
         return None
     if kv_transfer_config.kv_connector == "MultiConnector":
@@ -36,9 +36,16 @@ def hisparse_host_pool_gib(
     ]
     if len(entries) > 1:
         raise ValueError("Only one HiSparseConnector may be configured")
-    if not entries:
+    return entries[0] if entries else None
+
+
+def hisparse_host_pool_gib(
+    kv_transfer_config: "KVTransferConfig | None",
+) -> float | None:
+    extra_config = hisparse_connector_extra_config(kv_transfer_config)
+    if extra_config is None:
         return None
-    host_pool_gib = entries[0].get("host_pool_gib")
+    host_pool_gib = extra_config.get("host_pool_gib")
     if host_pool_gib is None:
         raise ValueError("HiSparseConnector requires host_pool_gib")
     host_pool_gib = float(host_pool_gib)

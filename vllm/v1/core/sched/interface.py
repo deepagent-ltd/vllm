@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, Any, Protocol
 
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 
@@ -33,6 +33,24 @@ class PauseState(enum.IntEnum):
     UNPAUSED = 0
     PAUSED_NEW = 1
     PAUSED_ALL = 2
+
+
+class SynchronousStepRPC(Protocol):
+    """Named, timed collective owned by a synchronous scheduler callback."""
+
+    def __call__(
+        self,
+        method: str,
+        *,
+        timeout: float,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[Any]: ...
+
+
+SynchronousStepCallback = Callable[
+    ["SchedulerOutput", "ModelRunnerOutput", SynchronousStepRPC], None
+]
 
 
 class SchedulerInterface(ABC):
@@ -109,6 +127,47 @@ class SchedulerInterface(ABC):
 
         """
         raise NotImplementedError
+
+    def get_worker_startup_callback(
+        self,
+    ) -> Callable[[SynchronousStepRPC], None] | None:
+        """Opt in to one owner-thread callback after worker cache initialization.
+
+        The engine invokes it before serving requests. The named, timed worker
+        RPC belongs to this callback and expires when the callback returns.
+        """
+        return None
+
+    def get_owner_worker_control_registration(
+        self,
+    ) -> tuple[tuple[str, ...], Callable[[SynchronousStepRPC], None]] | None:
+        """Bind named worker controls to a synchronous EngineCore owner.
+
+        The registration supplies the exact allowed method names and a binder.
+        Calls from another thread or inside a step/startup RPC are refused.
+        This is an internal scheduler capability, independent of user RPCs.
+        """
+        return None
+
+    def get_synchronous_step_callback(self) -> SynchronousStepCallback | None:
+        """Opt in to post-update work before a later forward can run.
+
+        The engine reads this once at startup. An opted-in scheduler must use
+        synchronous scheduling and one in-flight batch. The callback receives
+        the original scheduler and model outputs after the scheduler commits
+        the step, along with a named, bounded, blocking worker RPC. The RPC
+        belongs to the engine owner thread and is valid during the callback.
+        """
+        return None
+
+    def get_quiescent_callback(self) -> tuple[int, Callable[[], object]] | None:
+        """Optionally poll bounded owner-thread work while awaiting input.
+
+        Return the interval in nanoseconds (at least one millisecond) and a
+        nonblocking callback. EngineCoreProc reads the registration at startup
+        and calls it after an idle input timeout, with no scheduler/batch work.
+        """
+        return None
 
     @abstractmethod
     def update_draft_token_ids(self, draft_token_ids: "DraftTokenIds") -> None:

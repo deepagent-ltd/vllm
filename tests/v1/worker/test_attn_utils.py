@@ -750,9 +750,9 @@ def test_profiling_cleanup_keeps_host_pool_for_real_kv_cache():
 
 
 @pytest.mark.parametrize("failure_phase", ["allocation", "views", "binding", "buffers"])
-@pytest.mark.parametrize("shared", [False, True])
-def test_init_hisparse_rolls_back_host_pool(monkeypatch, failure_phase, shared):
-    """Failed initialization must release shared or private registrations."""
+@pytest.mark.parametrize("backing", ["private", "shared", "external"])
+def test_init_hisparse_rolls_back_host_pool(monkeypatch, failure_phase, backing):
+    """Failed initialization must release registrations and preserve its error."""
 
     class Backend(CUDAHiSparseBackend):
         def prepare_kv_cache_views(self, *args):
@@ -778,14 +778,19 @@ def test_init_hisparse_rolls_back_host_pool(monkeypatch, failure_phase, shared):
         instance_id="rollback",
     )
     pools = []
+    release = MagicMock(side_effect=[RuntimeError("lease release failed"), None])
 
     def allocate(*args, **kwargs):
         pools.append(args[-1])
-        if shared:
+        if backing == "shared":
             args[-1].shared_region = region
         else:
             args[-1].registered = registered
             args[-1].backing = registered[:8]
+        if backing == "external":
+            args[-1].external_lease = hisparse_runtime_module.HiSparseHostMemoryLease(
+                registered, release
+            )
         args[-1].pinned = [registered]
         if failure_phase == "allocation":
             raise RuntimeError("initialization failed")
@@ -804,7 +809,7 @@ def test_init_hisparse_rolls_back_host_pool(monkeypatch, failure_phase, shared):
     monkeypatch.setattr(
         attn_utils_module, "initialize_hisparse_runtime_buffers", buffers
     )
-    with pytest.raises(RuntimeError, match="initialization failed"):
+    with pytest.raises(RuntimeError, match="initialization failed") as exc:
         attn_utils_module.init_hisparse_kv_cache(
             SimpleNamespace(),
             torch.device("cpu"),
@@ -813,8 +818,18 @@ def test_init_hisparse_rolls_back_host_pool(monkeypatch, failure_phase, shared):
             {},
             SimpleNamespace(),
         )
-    assert region.cleanup_calls == int(shared)
+    assert region.cleanup_calls == int(backing == "shared")
     cudart.cudaHostUnregister.assert_called_once_with(registered.data_ptr())
+    if backing == "external":
+        (note,) = exc.value.__notes__
+        assert note.startswith("HiSparse lease cleanup failed during rollback:")
+        assert "lease release failed" in note
+        assert attn_utils_module.get_hisparse_host_pool(vllm_config, None) is pools[0]
+        with pytest.raises(RuntimeError, match="retiring"):
+            pools[0].allocate(8)
+        release.assert_called_once_with()
+        hisparse_runtime_module.drop_hisparse_host_pool(vllm_config)
+        assert release.call_count == 2
     assert attn_utils_module.get_hisparse_host_pool(vllm_config, None) is not pools[0]
     hisparse_runtime_module.drop_hisparse_host_pool(vllm_config)
 

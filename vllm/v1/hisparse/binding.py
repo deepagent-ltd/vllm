@@ -244,10 +244,15 @@ def init_hisparse_kv_cache(
             max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
         )
         return kv_caches
-    except Exception:
+    except Exception as init_error:
         release_pinned_state(host_pool.pinned, host_pool.shared_region)
         unbind_hisparse_caches(forward_context)
-        drop_hisparse_host_pool(vllm_config)
+        try:
+            drop_hisparse_host_pool(vllm_config)
+        except Exception as cleanup_error:
+            init_error.add_note(
+                f"HiSparse lease cleanup failed during rollback: {cleanup_error!r}"
+            )
         raise
 
 
