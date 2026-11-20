@@ -201,15 +201,21 @@ def get_hisparse_page_layer_configs(
         gpu_block_size,
     )
     assert config is not None
-    resident_manager = HiSparseResidentManager.config()
+    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     hot_manager = HiSparseHotManager.config(
         blocks_per_request=cdiv(config.device_buffer_size, gpu_block_size)
     )
     layer_configs: dict[str, KVCacheLayerConfig] = {}
     for name, spec in source_specs.items():
         layer_configs[f"{name}{HISPARSE_RESIDENT_SUFFIX}"] = KVCacheLayerConfig(
-            resident_manager,
-            HiSparsePageSpec(block_size=gpu_block_size, page_size=spec.page_size_bytes),
+            HiSparseResidentManager.config(
+                dcp_world_size=dcp_size if spec.dcp_sharded else 1,
+            ),
+            HiSparsePageSpec(
+                block_size=gpu_block_size,
+                page_size=spec.page_size_bytes,
+                dcp_sharded=spec.dcp_sharded,
+            ),
         )
         layer_configs[f"{name}{HISPARSE_HOT_SUFFIX}"] = KVCacheLayerConfig(
             hot_manager,
@@ -365,12 +371,14 @@ def create_hisparse_layout(
         raise ValueError("HiSparse has no allocatable host blocks.")
     # Every computed page needs a host block, so one request at max_model_len
     # must fit alongside the pool's null block and a copy-on-write tail.
-    gpu_block_size = source_group.block_size
-    min_host_blocks = cdiv(vllm_config.model_config.max_model_len, gpu_block_size) + 2
+    logical_block_tokens = source_group.block_size
+    if source_group.dcp_sharded:
+        logical_block_tokens *= vllm_config.parallel_config.decode_context_parallel_size
+    min_host_blocks = source_group.max_num_blocks_per_req(vllm_config) + 2
     if host_num_blocks < min_host_blocks:
         raise ValueError(
-            f"HiSparse host pool holds {host_num_blocks * gpu_block_size} tokens "
-            f"but max_model_len needs {min_host_blocks * gpu_block_size}; "
+            f"HiSparse host pool holds {host_num_blocks * logical_block_tokens} tokens "
+            f"but max_model_len needs {min_host_blocks * logical_block_tokens}; "
             f"increase host_pool_gib to at least "
             f"{cdiv(min_host_blocks * logical_block_bytes * 100, GiB_bytes) / 100:.2f}."
         )
@@ -378,7 +386,7 @@ def create_hisparse_layout(
         "HiSparse host pool: %.2f GiB per replica holds %d tokens; pinning "
         "%.2f GiB %s.",
         host_budget / GiB_bytes,
-        host_num_blocks * gpu_block_size,
+        host_num_blocks * logical_block_tokens,
         host_num_blocks * host_block_stride / GiB_bytes,
         "per replica, shared by its TP ranks" if shared_host_pool else "per rank",
     )

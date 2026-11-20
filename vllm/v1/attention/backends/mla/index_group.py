@@ -231,9 +231,15 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         cache = self.cache(layer_index)
         num_tokens = logical_topk_indices.shape[0]
         req_id_per_token = attn_metadata.req_id_per_token[:num_tokens]
-        if num_tokens > cache.runtime.max_swap_rows or (
-            cache.all_context_pages_resident
-            and cache.num_decode_tokens < cache.num_actual_tokens
+        dcp_decode = getattr(attn_metadata, "hisparse_dcp_decode", None)
+        if dcp_decode is not None and num_tokens > attn_metadata.num_decode_tokens:
+            raise ValueError("HiSparse DCP decode cannot consume prefill queries.")
+        if dcp_decode is None and (
+            num_tokens > cache.runtime.max_swap_rows
+            or (
+                cache.all_context_pages_resident
+                and cache.num_decode_tokens < cache.num_actual_tokens
+            )
         ):
             # Prefill-sized batches do not fit the decode residency workspace.
             # Non-resident prefills are staged before reaching this path.
@@ -259,19 +265,31 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
             block_size=attn_metadata.block_size,
             return_valid_counts=return_valid_counts,
             num_valid_rows=attn_metadata.query_start_loc[-1:],
+            dcp_decode=dcp_decode,
         )
 
     def stage_prefill_rows(
         self, layer_index: int, kv_cache: torch.Tensor, attn_metadata: Any
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cache = self.cache(layer_index)
-        prefill = attn_metadata.prefill
-        staging_plan = prefill.host_staging_plan if prefill is not None else None
-        assert staging_plan is not None
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        dcp_plan = getattr(attn_metadata, "hisparse_prefill_plan", None)
+        if dcp_plan is not None:
+            assert dcp_plan.query_context_lens is not None
+            end = num_decode_tokens + dcp_plan.query_context_lens.numel()
+            staging_plan = dcp_plan
+        else:
+            prefill = attn_metadata.prefill
+            staging_plan = prefill.host_staging_plan if prefill is not None else None
+            assert staging_plan is not None
+            end = None
         staged_cache = cache.stage_prefill_rows(
-            kv_cache, staging_plan, attn_metadata.num_decodes
+            kv_cache,
+            staging_plan,
+            attn_metadata.num_decodes,
+            num_decode_tokens=num_decode_tokens,
         )
-        req_ids = attn_metadata.req_id_per_token[attn_metadata.num_decode_tokens :]
+        req_ids = attn_metadata.req_id_per_token[num_decode_tokens:end]
         if attn_metadata.num_decodes > 0:
             req_ids = req_ids - attn_metadata.num_decodes
         return staged_cache, staging_plan.block_table, req_ids

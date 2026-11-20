@@ -46,6 +46,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_planning import (
     _pool_bytes_per_block,
@@ -74,6 +75,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     HiSparseResidentManager,
     HiSparseSourceManager,
     SinkFullAttentionManager,
+    create_single_type_manager,
     get_kv_cache_kind,
 )
 from vllm.v1.hisparse.layout import (
@@ -149,8 +151,13 @@ def test_hisparse_steady_state_concurrency_excludes_spilled_resident_pages():
 
 
 @pytest.mark.parametrize("extra_blocks,ok", [(1, False), (2, True)])
-def test_hisparse_host_pool_must_fit_max_model_len(monkeypatch, extra_blocks, ok):
-    """Every page needs a host block, so one max_model_len request must fit."""
+@pytest.mark.parametrize(
+    "physical_page,row_bytes,dcp_size", [(64, 656, 1), (64, 656, 8), (256, 528, 8)]
+)
+def test_hisparse_host_pool_must_fit_max_model_len(
+    monkeypatch, extra_blocks, ok, physical_page, row_bytes, dcp_size
+):
+    """One host page covers a logical DCP span at unchanged physical cost."""
     monkeypatch.setattr(
         current_platform,
         "get_hisparse_backend_cls",
@@ -158,41 +165,103 @@ def test_hisparse_host_pool_must_fit_max_model_len(monkeypatch, extra_blocks, ok
     )
     specs = {
         "model.layers.0.self_attn": MLAAttentionSpec(
-            block_size=64,
+            block_size=physical_page,
             num_kv_heads=1,
-            head_size=576,
-            dtype=torch.bfloat16,
+            head_size=512,
+            state_content_bytes=row_bytes,
+            dtype=torch.uint8,
             cache_role=SparseCacheRole.SPARSE,
             is_index_group_leader=True,
         ),
         "model.layers.0.self_attn.indexer": MLAAttentionSpec(
-            block_size=64,
+            block_size=physical_page,
             num_kv_heads=1,
             head_size=128,
             dtype=torch.bfloat16,
             cache_role=SparseCacheRole.INDEXER,
         ),
     }
+    logical_page = physical_page * dcp_size
     config = SimpleNamespace(
         attention_config=SimpleNamespace(hisparse_config=HiSparseConfig()),
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(index_topk=128), max_model_len=64 * 4
+            hf_text_config=SimpleNamespace(index_topk=128),
+            max_model_len=logical_page * 4,
         ),
-        parallel_config=SimpleNamespace(tensor_parallel_size=1, world_size=1),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=dcp_size,
+            world_size=dcp_size,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=dcp_size,
+        ),
         cache_config=SimpleNamespace(num_gpu_blocks_override=7, kv_cache_layout=None),
+        max_in_flight_tokens=logical_page,
     )
-    host_page = specs["model.layers.0.self_attn"].page_size_bytes
-    host_budget = (4 + extra_blocks) * host_page
     groups = get_hisparse_kv_cache_groups(
         config, {name: full_layer(spec) for name, spec in specs.items()}
     )
-
+    host_page_bytes = physical_page * row_bytes
+    host_budget = (4 + extra_blocks) * host_page_bytes
     if ok:
         layout = create_hisparse_layout(config, groups, host_budget=host_budget)
         assert layout.host_num_blocks == 4 + extra_blocks
+        assert layout.host_block_stride == host_page_bytes
+        assert not layout.shared_host_pool
+        assert layout.source_group.max_num_blocks_per_req(config) == 4
+        (resident,) = [
+            group for group in groups if group.manager_cls is HiSparseResidentManager
+        ]
+        (hot,) = [group for group in groups if group.manager_cls is HiSparseHotManager]
+        assert resident.dcp_sharded
+        assert resident.page_size_bytes == host_page_bytes
+        assert not hot.dcp_sharded
+        assert resident.max_num_blocks_per_req(config) == 4
+        manager = create_single_type_manager(
+            resident,
+            config.max_in_flight_tokens,
+            config.model_config.max_model_len,
+            block_pool=BlockPool(7, False, physical_page),
+            enable_caching=False,
+            kv_cache_group_id=0,
+            scheduler_block_size=logical_page,
+            dcp_world_size=dcp_size,
+        )
+        assert manager.block_size == logical_page
+        assert (
+            resident.max_allocated_blocks_per_request(config)
+            == (manager.max_admission_blocks_per_request)
+            == (1 if dcp_size == 1 else 3)
+        )
     else:
         with pytest.raises(ValueError, match="increase host_pool_gib"):
             create_hisparse_layout(config, groups, host_budget=host_budget)
+
+
+def test_connector_clips_block_ids_using_logical_dcp_span():
+    sharded = AttentionSpec(
+        block_size=64, num_kv_heads=1, head_size=64, dtype=torch.float16
+    )
+    local = AttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        dcp_sharded=False,
+    )
+    manager = KVCacheManager.__new__(KVCacheManager)
+    manager.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            new_kv_cache_group(["sharded"], sharded),
+            new_kv_cache_group(["local"], local),
+        ]
+    )
+    manager.coordinator = SimpleNamespace(group_block_sizes=(512, 64))
+    manager.get_block_ids = lambda request_id: (list(range(10)), list(range(10)))
+    assert manager.get_block_ids_for_computed_tokens("request", 513) == (
+        [0, 1],
+        list(range(9)),
+    )
 
 
 def test_hisparse_derived_specs_do_not_affect_kv_cache_layout(monkeypatch):

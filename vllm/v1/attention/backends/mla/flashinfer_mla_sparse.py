@@ -206,7 +206,21 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
 
     @classmethod
     def supports_hisparse(cls) -> bool:
-        return False
+        return cls.supports_dcp()
+
+    @classmethod
+    def supports_dcp(cls) -> bool:
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is None:
+            return False
+        hisparse = config.attention_config.hisparse_config
+        return (
+            hisparse is not None
+            and hisparse.enable_dcp
+            and config.parallel_config.decode_context_parallel_size == 8
+        )
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:

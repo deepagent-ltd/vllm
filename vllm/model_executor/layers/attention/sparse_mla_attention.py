@@ -49,7 +49,10 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    split_decodes_and_prefills,
+)
 from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.shardq import (
@@ -58,6 +61,7 @@ from vllm.v1.attention.ops.shardq import (
     build_shardq_split,
 )
 from vllm.v1.hisparse.runtime import (
+    HiSparseDCPDecodeMetadata,
     HiSparsePrefillStagingPlan,
     build_hisparse_prefill_staging_plan,
     hisparse_staging_block_capacity,
@@ -275,6 +279,8 @@ class SparseMLACommonMetadata(MLACommonMetadata[MLACommonDecodeMetadata]):
     decode_max_query_len: int = 0
     prefill_max_seq_len: int = 0
     prefill: SparseMLAPrefillMetadata | None = None
+    hisparse_prefill_plan: HiSparsePrefillStagingPlan | None = None
+    hisparse_dcp_decode: HiSparseDCPDecodeMetadata | None = None
     cp_kv_cache_interleave_size: int = 1
     # Set on token-sharded TP prefill steps (see vllm.v1.attention.ops.shardq).
     shardq: ShardQMetadata | None = None
@@ -345,10 +351,13 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
         try:
-            self.dcp_world_size = get_dcp_group().world_size
+            dcp_group = get_dcp_group()
+            self.dcp_world_size = dcp_group.world_size
+            self.dcp_rank = dcp_group.rank_in_group
         except AssertionError:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
+            self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_local_block_size = self.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
@@ -487,6 +496,69 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             dcp_manager=self.dcp_manager,
         )
 
+    def _build_hisparse_dcp_prefill_plan(
+        self,
+        common: "CommonAttentionMetadata",
+        req_ids: torch.Tensor,
+        num_decodes: int,
+        num_prefills: int,
+        num_decode_tokens: int,
+        num_prefill_tokens: int,
+    ) -> HiSparsePrefillStagingPlan:
+        end = num_decodes + num_prefills
+        rank = self.dcp_rank
+        dcp = self.dcp_world_size
+        interleave = self.cp_kv_cache_interleave_size
+        block_size = self.kv_cache_spec.block_size
+        seq_lens = common.seq_lens[num_decodes:end]
+        local_upper = common.dcp_local_seq_lens_cpu_upper_bound
+        if local_upper is None:
+            seq_lens_cpu = common.seq_lens_cpu_upper_bound
+            assert seq_lens_cpu is not None
+            local_upper = get_dcp_local_seq_lens(seq_lens_cpu, dcp, rank, interleave)
+        capacity = hisparse_staging_block_capacity(
+            local_upper[num_decodes:end], block_size
+        )
+        plan = build_hisparse_prefill_staging_plan(
+            common.block_table_tensor[num_decodes:end],
+            seq_lens,
+            block_size,
+            capacity,
+            dcp_size=dcp,
+            dcp_rank=rank,
+            interleave=interleave,
+        )
+        tail = slice(num_decode_tokens, num_decode_tokens + num_prefill_tokens)
+        local_req_ids = req_ids[tail] - num_decodes
+        # P writes form a contiguous suffix of each exact device sequence.
+        positions = (
+            common.compute_num_computed_tokens()[num_decodes:end][local_req_ids]
+            + torch.arange(num_prefill_tokens, device=self.device)
+            - (
+                common.query_start_loc[num_decodes:end][local_req_ids]
+                - num_decode_tokens
+            )
+        )
+        if common.is_dummy:
+            # Capture supplies null page tables, PAD slots and synthetic positions.
+            # PIECEWISE attention is rebuilt when replaying a real batch.
+            plan.query_context_lens = (positions + 1).to(torch.int32)
+            return plan
+        if common.positions is not None:
+            torch._assert_async(
+                (common.positions[tail] == positions).all(),
+                "HiSparse prefill positions do not cover the current query suffix.",
+            )
+        plan.bind_dcp_writer_rows(
+            local_req_ids,
+            positions,
+            common.slot_mapping[tail],
+            dcp_size=dcp,
+            dcp_rank=rank,
+            interleave=interleave,
+        )
+        return plan
+
     def build(
         self,
         common_prefix_len: int,
@@ -495,12 +567,48 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
     ) -> T:
         req_id_per_token = self._build_req_id_per_token(common_attn_metadata)
 
-        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
-            common_attn_metadata,
-            decode_threshold=self.reorder_batch_threshold or 1,
-            treat_short_extends_as_decodes=not self.use_pcp,
-            require_uniform=self.require_uniform_decodes,
+        hisparse_dcp = (
+            self.dcp_world_size > 1
+            and self.vllm_config.attention_config.hisparse_config is not None
         )
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold or 1,
+                treat_short_extends_as_decodes=not (self.use_pcp or hisparse_dcp),
+                require_uniform=self.require_uniform_decodes,
+            )
+        )
+        hisparse_prefill_plan = None
+        hisparse_dcp_decode = None
+        if hisparse_dcp:
+            if (
+                self.use_pcp
+                or self.use_shardq
+                or not self.kv_cache_spec.dcp_sharded
+                or self._prefill_backend is not None
+                or common_attn_metadata.causal is not True
+            ):
+                raise NotImplementedError(
+                    "HiSparse DCP requires rank-local causal MQA."
+                )
+            if num_decodes:
+                hisparse_dcp_decode = HiSparseDCPDecodeMetadata.from_common(
+                    common_attn_metadata,
+                    num_decodes,
+                    size=self.dcp_world_size,
+                    rank=self.dcp_rank,
+                    interleave=self.cp_kv_cache_interleave_size,
+                )
+            if num_prefills:
+                hisparse_prefill_plan = self._build_hisparse_dcp_prefill_plan(
+                    common_attn_metadata,
+                    req_id_per_token,
+                    num_decodes,
+                    num_prefills,
+                    num_decode_tokens,
+                    num_prefill_tokens,
+                )
         (
             prefill_query_start_loc,
             prefill_max_query_len,
@@ -590,6 +698,8 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             decode_max_query_len=decode_max_query_len,
             prefill_max_seq_len=prefill_max_seq_len,
             prefill=prefill,
+            hisparse_prefill_plan=hisparse_prefill_plan,
+            hisparse_dcp_decode=hisparse_dcp_decode,
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
         )
         if shardq_split is not None:

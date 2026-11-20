@@ -1292,6 +1292,93 @@ class VllmConfig:
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
 
+    def _verify_hisparse_dcp_config(self) -> None:
+        """Check the supported SM120 host-backed mode before pool allocation."""
+        from vllm.platforms.interface import DeviceCapability
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        attention = self.attention_config
+        hisparse = attention.hisparse_config
+        assert hisparse is not None
+        if not hisparse.enable_dcp:
+            raise ValueError("HiSparse does not support decode context parallelism.")
+
+        parallel = self.parallel_config
+        if (
+            (
+                parallel.tensor_parallel_size,
+                parallel.decode_context_parallel_size,
+                parallel.prefill_context_parallel_size,
+                parallel.pipeline_parallel_size,
+                parallel.data_parallel_size,
+                parallel.cp_kv_cache_interleave_size,
+            )
+            != (8, 8, 1, 1, 1, 4)
+            or parallel.distributed_executor_backend != "mp"
+            or parallel.nnodes_within_dp != 1
+            or parallel.dcp_comm_backend not in (None, "ag_rs")
+            or parallel.dcp_q_replicate
+            or not parallel.enable_expert_parallel
+            or parallel.enable_eplb
+            or parallel.enable_elastic_ep
+            or self.speculative_config is not None
+        ):
+            raise ValueError(
+                "HiSparse DCP requires single-node MP, TP8/EP8/DCP8, "
+                "DP1/PP1/PCP1, interleave 4, ag_rs, and no speculative decoding "
+                "or expert rebalancing."
+            )
+        cache = self.cache_config
+        if (
+            not cache.user_specified_block_size
+            or cache.block_size != 256
+            or cache.cache_dtype != "fp8_ds_mla"
+            or cache.enable_prefix_caching
+            or cache.enable_extensible_kv_cache is not False
+            or cache.kv_cache_dtype_skip_layers
+            or cache.mamba_cache_mode != "none"
+            or not hisparse.eager_host_mirror
+        ):
+            raise ValueError(
+                "HiSparse DCP requires explicit B256, fp8_ds_mla, eager host "
+                "mirroring, and prefix caching and extensible KV cache disabled."
+            )
+
+        transfer = self.kv_transfer_config
+        if (
+            transfer is None
+            or transfer.kv_connector != "HiSparseConnector"
+            or transfer.kv_role != "kv_both"
+            or transfer.kv_connector_extra_config.get("host_pool_allocator") is not None
+        ):
+            raise ValueError(
+                "HiSparse DCP requires a direct HiSparseConnector with native "
+                "rank-local host backing."
+            )
+
+        backend = attention.backend_per_kind.get("mla_attention", attention.backend)
+        if (
+            backend != AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120
+            or not current_platform.is_cuda()
+            or current_platform.get_device_capability() != DeviceCapability(12, 0)
+        ):
+            raise ValueError(
+                "HiSparse DCP requires explicit FLASHINFER_MLA_SPARSE_SM120 on SM120."
+            )
+        model = self.model_config
+        if model is None or model.architecture != "Glm5NextForConditionalGeneration":
+            raise ValueError("HiSparse DCP requires the GLM-5.3-Flash MLA layout.")
+        text = model.hf_text_config
+        if model.dtype != torch.bfloat16 or (
+            getattr(text, "model_type", None),
+            getattr(text, "num_attention_heads", None),
+            getattr(text, "kv_lora_rank", None),
+            getattr(text, "qk_nope_head_dim", None),
+            getattr(text, "qk_rope_head_dim", None),
+            getattr(text, "index_topk", None),
+        ) != ("glm5_next_text", 64, 512, 256, 0, 2048):
+            raise ValueError("HiSparse DCP requires the GLM-5.3-Flash MLA layout.")
+
     def _verify_aux_output_compatibility(self) -> None:
         """Reject configurations unsupported by enabled auxiliary outputs."""
         if not self.aux_output_config.enabled:
@@ -1984,10 +2071,11 @@ class VllmConfig:
                 raise ValueError("The current platform does not support HiSparse.")
             if self.parallel_config.pipeline_parallel_size > 1:
                 raise ValueError("HiSparse does not support pipeline parallelism.")
-            if self.parallel_config.decode_context_parallel_size > 1:
-                raise ValueError(
-                    "HiSparse does not support decode context parallelism."
-                )
+            if (
+                self.parallel_config.decode_context_parallel_size > 1
+                or self.attention_config.hisparse_config.enable_dcp
+            ):
+                self._verify_hisparse_dcp_config()
             if self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
                 raise ValueError(
                     "HiSparse does not support cudagraph_mode=FULL; use "

@@ -796,6 +796,66 @@ def test_hisparse_rejects_decode_context_parallelism(monkeypatch):
         )
 
 
+def test_hisparse_dcp_sm120_layout_is_explicitly_scoped(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "get_device_capability", lambda: DeviceCapability(12, 0)
+    )
+    config = SimpleNamespace(
+        attention_config=AttentionConfig(
+            backend="FLASHINFER_MLA_SPARSE_SM120",
+            hisparse_config=HiSparseConfig(enable_dcp=True),
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            decode_context_parallel_size=8,
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            cp_kv_cache_interleave_size=4,
+            distributed_executor_backend="mp",
+            nnodes_within_dp=1,
+            dcp_comm_backend="ag_rs",
+            dcp_q_replicate=False,
+            enable_expert_parallel=True,
+            enable_eplb=False,
+            enable_elastic_ep=False,
+        ),
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            user_specified_block_size=True,
+            block_size=256,
+            cache_dtype="fp8_ds_mla",
+            enable_prefix_caching=False,
+            enable_extensible_kv_cache=False,
+            kv_cache_dtype_skip_layers=[],
+            mamba_cache_mode="none",
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="HiSparseConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"host_pool_gib": 8},
+        ),
+        model_config=SimpleNamespace(
+            architecture="Glm5NextForConditionalGeneration",
+            dtype=torch.bfloat16,
+            hf_text_config=SimpleNamespace(
+                model_type="glm5_next_text",
+                num_attention_heads=64,
+                kv_lora_rank=512,
+                qk_nope_head_dim=256,
+                qk_rope_head_dim=0,
+                index_topk=2048,
+            ),
+        ),
+    )
+    VllmConfig._verify_hisparse_dcp_config(config)
+
+    config.model_config.hf_text_config.qk_rope_head_dim = 64
+    with pytest.raises(ValueError, match="GLM-5.3-Flash MLA layout"):
+        VllmConfig._verify_hisparse_dcp_config(config)
+
+
 def test_hisparse_rejects_pipeline_parallelism(monkeypatch):
     monkeypatch.setattr(
         current_platform,

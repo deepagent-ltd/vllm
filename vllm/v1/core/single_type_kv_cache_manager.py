@@ -21,6 +21,7 @@ from vllm.v1.core.kv_cache_utils import (
     trim_null_head,
 )
 from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
+from vllm.v1.hisparse.types import ACTIVE_TAIL_PAGES
 from vllm.v1.kv_cache_interface import (
     KVCacheGroup,
     KVCacheLayerConfig,
@@ -3235,6 +3236,10 @@ class HiSparseHotManager(_HiSparseAuxiliaryManager):
 class HiSparseResidentManager(_HiSparseAuxiliaryManager):
     """Track GPU-resident pages for otherwise host-backed KV."""
 
+    @dataclass(frozen=True, slots=True)
+    class Params(SingleTypeKVCacheManager.Params):
+        dcp_world_size: int = 1
+
     max_admission_blocks_per_request: int
 
     @classmethod
@@ -3245,10 +3250,21 @@ class HiSparseResidentManager(_HiSparseAuxiliaryManager):
         max_in_flight_tokens: int,
         max_model_len: int,
     ) -> int | None:
-        return cdiv(min(max_in_flight_tokens, max_model_len), block_size)
+        assert isinstance(config.params, HiSparseResidentManager.Params)
+        dcp_size = config.params.dcp_world_size
+        block_span = block_size * dcp_size
+        scheduled_blocks = cdiv(min(max_in_flight_tokens, max_model_len), block_span)
+        if dcp_size == 1:
+            return scheduled_blocks
+        # Retain the active resident tail while the next step appends pages.
+        return min(
+            cdiv(max_model_len, block_span), ACTIVE_TAIL_PAGES + scheduled_blocks
+        )
 
     def __init__(self, kv_cache_group: KVCacheGroup, **kwargs) -> None:
         super().__init__(kv_cache_group, **kwargs)
+        assert isinstance(self.manager_config.params, HiSparseResidentManager.Params)
+        assert self.manager_config.params.dcp_world_size == self.dcp_world_size
         self.residency_changes: dict[str, dict[int, KVCacheBlock]] = {}
 
     def get_num_blocks_to_allocate(
