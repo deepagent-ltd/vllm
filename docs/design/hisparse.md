@@ -350,3 +350,14 @@ all block IDs, free lists and readiness.
 Engine owners that use timed lifecycle RPCs need a collective executor
 advertising `supports_timed_collective_rpc`. Executors without that
 capability reject activation of these hooks.
+
+### Rank-local SM120 decode context parallelism
+
+Set `hisparse_config.enable_dcp` to opt in to host-backed DCP on SM120.
+The initial supported configuration is GLM-5.3-Flash MLA, a single
+TP8/EP8/DCP8 group, physical KV blocks of 256 rows, interleave 4,
+`fp8_ds_mla`, and the explicitly selected FlashInfer SM120 sparse backend.
+Speculative decoding and prefix caching are disabled in this configuration.
+Each rank keeps native private host backing and returns a base-2 log-sum-exp
+for the existing DCP reduction. A rank with no selected keys contributes
+zero output and negative-infinite log-sum-exp.

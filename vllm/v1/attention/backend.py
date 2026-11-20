@@ -459,6 +459,9 @@ class CommonAttentionMetadata:
     has positions available so that builders can pre-compute position-dependent
     sparse metadata for DeepSeek V4 C128A layers."""
 
+    is_dummy: bool = False
+    """Whether the worker built this synthetic batch without live request state."""
+
     is_prefilling: torch.Tensor | None = None
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
@@ -555,6 +558,7 @@ class CommonAttentionMetadata:
                 self.dcp_local_seq_lens_cpu_upper_bound
             ),
             seq_lens_cpu_upper_bound=maybe_slice_reqs(self.seq_lens_cpu_upper_bound),
+            is_dummy=self.is_dummy,
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             req_idx=maybe_slice_reqs(self.req_idx),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),

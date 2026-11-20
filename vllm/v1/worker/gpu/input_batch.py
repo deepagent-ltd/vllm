@@ -130,6 +130,7 @@ class InputBatch:
     # [num_reqs] admitted draft counts in flight to the host. Set only under
     # adaptive verification with batch-sharded sampling, when the budget binds.
     num_admitted_draft_tokens: "AdmittedDraftCounts | None" = None
+    is_dummy: bool = False
 
     @classmethod
     def make_dummy(
@@ -223,6 +224,7 @@ class InputBatch:
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=False,
+            is_dummy=True,
             prompt_lens=None,
             max_query_len=max_query_len,
         )

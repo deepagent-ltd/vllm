@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.stats import (
     HiSparseKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_dcp_group,
     get_tensor_model_parallel_rank,
     get_tp_group,
 )
@@ -101,6 +102,60 @@ def _flatten_row_mirrors(
         for request_id in ordered_ids
         for mirror in row_mirrors.get(request_id, ())
     )
+
+
+def _localize_dcp_row_mirrors(
+    mirrors: tuple[SparseKVRowMirror, ...],
+    *,
+    block_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    interleave: int,
+) -> tuple[SparseKVRowMirror, ...]:
+    """Convert scheduler logical-page spans into this worker's DMA rows."""
+    if (
+        not 0 <= dcp_rank < dcp_size
+        or interleave <= 0
+        or block_size <= 0
+        or block_size % interleave
+    ):
+        raise ValueError("Invalid HiSparse DCP mirror geometry.")
+    logical_block_size = block_size * dcp_size
+    stripe_width = interleave * dcp_size
+
+    def local_prefix(offset: int) -> int:
+        stripes, remainder = divmod(offset, stripe_width)
+        return stripes * interleave + min(
+            max(remainder - dcp_rank * interleave, 0), interleave
+        )
+
+    localized = []
+    for mirror in mirrors:
+        destination_page, offset = divmod(mirror.destination_start, logical_block_size)
+        end = offset + mirror.num_rows
+        if destination_page <= 0 or mirror.num_rows <= 0 or end > logical_block_size:
+            raise ValueError("Invalid HiSparse DCP mirror destination span.")
+
+        source_pages = []
+        for start in mirror.source_starts:
+            source_page, source_offset = divmod(start, logical_block_size)
+            if source_page <= 0 or source_offset != offset:
+                raise ValueError("Invalid HiSparse DCP mirror source span.")
+            source_pages.append(source_page)
+
+        local_begin = local_prefix(offset)
+        local_count = local_prefix(end) - local_begin
+        if local_count:
+            localized.append(
+                SparseKVRowMirror(
+                    source_starts=tuple(
+                        page * block_size + local_begin for page in source_pages
+                    ),
+                    destination_start=destination_page * block_size + local_begin,
+                    num_rows=local_count,
+                )
+            )
+    return tuple(localized)
 
 
 def _select_written_row_mirrors(
@@ -188,6 +243,7 @@ class HiSparseConnectorWorker:
     """Own HiSparse host/hot state and execute its worker-side transfers."""
 
     _in_step = False
+    _dcp_mirror_geometry: tuple[int, int, int] | None = None
     kv_sharing_handles: tuple[HiSparseCacheHandle, ...] = ()
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
@@ -235,6 +291,20 @@ class HiSparseConnectorWorker:
         host_num_blocks = self.kv_cache_config.hisparse_host_num_blocks
         assert host_num_blocks is not None
         try:
+            parallel = self.vllm_config.parallel_config
+            dcp_size = parallel.decode_context_parallel_size
+            if dcp_size > 1:
+                dcp_group = get_dcp_group()
+                if dcp_group.world_size != dcp_size or shared_host_region is not None:
+                    raise ValueError(
+                        "HiSparse DCP mirrors require a rank-local host pool "
+                        "and the configured DCP group."
+                    )
+                self._dcp_mirror_geometry = (
+                    dcp_size,
+                    dcp_group.rank_in_group,
+                    parallel.cp_kv_cache_interleave_size,
+                )
             self.initialize(
                 cache_handles,
                 cache_layer_names,
@@ -429,6 +499,15 @@ class HiSparseConnectorWorker:
         self._release_completed_dma_descriptors()
         self._dma_submitted = False
         mirrors = _flatten_row_mirrors(metadata.row_mirrors, request_ids)
+        if self._dcp_mirror_geometry is not None:
+            dcp_size, dcp_rank, interleave = self._dcp_mirror_geometry
+            mirrors = _localize_dcp_row_mirrors(
+                mirrors,
+                block_size=self.kernel_block_size,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
+                interleave=interleave,
+            )
         if self._slot_mapping_staging is not None:
             self._slot_mapping_staging.candidates = mirrors
         self._set_row_mirrors(mirrors)

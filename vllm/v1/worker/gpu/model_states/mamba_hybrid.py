@@ -338,6 +338,7 @@ class MambaHybridModelState(DefaultModelState):
             positions=input_batch.positions,
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
+            is_dummy=input_batch.is_dummy,
             rswa_prefix_lens=input_batch.prompt_lens,
         )
         if self._use_replayssm_trackers:

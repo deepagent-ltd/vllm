@@ -29,6 +29,9 @@ class HiSparseConfig:
     from the active backends.
     """
 
+    enable_dcp: bool = False
+    """Enable the experimental rank-local HiSparse DCP path on SM120."""
+
     eager_host_mirror: bool = True
     """Mirror decode-written KV rows to the host pool during the forward so
     page spills complete without moving data. When disabled, decode rows stay

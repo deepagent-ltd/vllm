@@ -36,6 +36,7 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import (
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.v1.attention.backend import CommonAttentionMetadata
     from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -552,27 +553,102 @@ class HiSparsePrefillStagingPlan:
     # Host rows with a GPU-resident copy (adopted shadow pages): the flat
     # resident-cache row to read instead of DMAing from host, -1 for misses.
     gpu_row_ids: torch.Tensor | None = None
-    gpu_source_key: tuple[int, int] | None = None
+    gpu_source_key: tuple[int, int, int] | None = None
+    writer_rows: torch.Tensor | None = None
+    writer_mask: torch.Tensor | None = None
+    query_context_lens: torch.Tensor | None = None
+
+    def bind_dcp_writer_rows(
+        self,
+        req_ids: torch.Tensor,
+        positions: torch.Tensor,
+        source_slots: torch.Tensor,
+        *,
+        dcp_size: int,
+        dcp_rank: int,
+        interleave: int,
+    ) -> None:
+        """Bind this step's owned writes to the native source group's exact slots."""
+        from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+
+        if self.writer_rows is not None:
+            raise RuntimeError("HiSparse prefill writer rows are already bound.")
+        if req_ids.shape != positions.shape or positions.shape != source_slots.shape:
+            raise ValueError("HiSparse prefill writer metadata shapes disagree.")
+        num_reqs, num_pages = self.block_table.shape
+        live_req = (req_ids >= 0) & (req_ids < num_reqs) & (positions >= 0)
+        owned = live_req & (positions // interleave % dcp_size == dcp_rank)
+        local = get_dcp_local_seq_lens(positions, dcp_size, dcp_rank, interleave)
+        page = local // self.block_size
+        valid_page = (page >= 0) & (page < num_pages)
+        staged = self.block_table[
+            req_ids.clamp(0, num_reqs - 1).long(),
+            page.clamp(0, num_pages - 1).long(),
+        ]
+        rows = (staged * self.block_size + local % self.block_size).long()
+        exact = (
+            valid_page
+            & (staged > 0)
+            & (source_slots >= self.block_size)
+            & (self.row_ids[0, rows] == source_slots)
+        )
+        torch._assert_async(
+            torch.where(owned, exact, source_slots < 0).all(),
+            "HiSparse prefill write does not own its native source slot.",
+        )
+        bound = owned & exact
+        self.writer_rows = torch.where(bound, rows, -1)
+        self.query_context_lens = torch.where(live_req, positions + 1, 0).to(
+            torch.int32
+        )
+        # Shared prefix references may alias. Active writers must have gone
+        # through admission/copy-on-write and own distinct destination rows.
+        scratch = self.row_ids.numel()
+        writers = rows.new_zeros(scratch + 1, dtype=torch.int32)
+        writers.scatter_add_(
+            0, torch.where(bound, rows, scratch), bound.to(torch.int32)
+        )
+        torch._assert_async(
+            (writers <= 1).all(), "HiSparse prefill writes alias a staging row."
+        )
+        self.writer_mask = writers[:-1].view_as(self.row_ids) > 0
 
     def ensure_gpu_sources(
         self,
         resident_state_rows: torch.Tensor,
         state_indices: torch.Tensor,
         resident_block_size: int,
+        *,
+        writer_slots: torch.Tensor | None = None,
+        resident_num_blocks: int | None = None,
     ) -> None:
         """Resolve which staged rows can be served from the resident cache.
 
-        `resident_state_rows` is a resident group's persistent table by
-        request state row and `state_indices` holds each staged request's
+        ``resident_state_rows`` is a resident group's persistent table by
+        request state row and ``state_indices`` holds each staged request's
         state row. Computed once per plan and resident group (every layer in
         the group shares the table); non-null resident pages become
-        miss_mask=0 rows gathered device-to-device by `gather_prefill_cache`.
+        miss_mask=0 rows gathered device-to-device by ``gather_prefill_cache``.
         """
-        source_key = (resident_state_rows.data_ptr(), resident_block_size)
+        if self.writer_rows is not None and (
+            writer_slots is None
+            or writer_slots.shape != self.writer_rows.shape
+            or resident_num_blocks is None
+        ):
+            raise ValueError(
+                "HiSparse prefill requires the native resident writer slots."
+            )
+        source_key = (
+            resident_state_rows.data_ptr(),
+            resident_block_size,
+            0 if writer_slots is None else writer_slots.data_ptr(),
+        )
         if self.gpu_source_key == source_key:
             return
         block_size = self.block_size
         if resident_block_size <= 0 or block_size % resident_block_size != 0:
+            if self.writer_rows is not None:
+                raise ValueError("HiSparse prefill resident page geometry disagrees.")
             return
         device = self.row_ids.device
         num_unique = self.row_ids.shape[1] // block_size
@@ -580,10 +656,17 @@ class HiSparsePrefillStagingPlan:
         new_bt = self.block_table.to(torch.int64)
         num_rows, num_cols = new_bt.shape
         if num_rows == 0 or state_indices.shape[0] < num_rows:
+            if self.writer_rows is not None:
+                raise ValueError(
+                    "HiSparse prefill resident request state is incomplete."
+                )
             return
-        resident_block_table = resident_state_rows.index_select(
-            0, state_indices[:num_rows].clamp(min=0)
-        )
+        indices = state_indices[:num_rows]
+        if self.writer_rows is not None:
+            # Padded request rows cannot borrow slot zero's resident pages.
+            live_state = (indices >= 0) & (indices < resident_state_rows.shape[0])
+            indices = torch.where(live_state, indices, 0)
+        resident_block_table = resident_state_rows.index_select(0, indices.clamp(min=0))
         # One representative (row, col) per unique host block: any request
         # referencing the block holds an equivalent (refcounted) resident view.
         flat_pos = torch.arange(num_rows * num_cols, device=device)
@@ -618,8 +701,44 @@ class HiSparsePrefillStagingPlan:
         # Block id 0 is the null block in both id spaces.
         valid_rows = self.row_ids.view(num_unique, block_size) >= 0
         hit = (per_off_block > 0) & (host_ids[:, None] > 0) & valid_rows
-        self.gpu_row_ids = torch.where(hit, gpu_rows, -1).reshape(1, -1).to(torch.int32)
-        self.miss_mask = ((self.gpu_row_ids < 0) & valid_rows.view(1, -1)).int()
+        if self.writer_rows is not None:
+            assert resident_num_blocks is not None
+            hit &= live_state[rep_row, None] & (per_off_block < resident_num_blocks)
+        gpu_row_ids = torch.where(hit, gpu_rows, -1).reshape(1, -1).to(torch.int32)
+        host_rows = valid_rows.view_as(self.row_ids)
+        if self.writer_rows is not None:
+            assert writer_slots is not None and resident_num_blocks is not None
+            assert self.writer_mask is not None
+            current = self.writer_rows >= 0
+            present = (
+                (writer_slots >= resident_block_size)
+                & (writer_slots < resident_num_blocks * resident_block_size)
+                & (
+                    writer_slots % resident_block_size
+                    == self.writer_rows % resident_block_size
+                )
+            )
+            torch._assert_async(
+                torch.where(current, present, writer_slots < 0).all(),
+                "HiSparse prefill write does not own its native resident slot.",
+            )
+            scratch = self.row_ids.numel()
+            resident_rows = self.row_ids.new_full((scratch + 1,), -1)
+            exact = current & present
+            resident_rows.scatter_reduce_(
+                0,
+                torch.where(exact, self.writer_rows, scratch),
+                torch.where(exact, writer_slots, -1).to(torch.int32),
+                reduce="amax",
+            )
+            gpu_row_ids = torch.where(
+                self.writer_mask, resident_rows[:-1].view_as(gpu_row_ids), gpu_row_ids
+            )
+            # A current writer row must never fall through to host DMA.
+            host_rows = host_rows & ~self.writer_mask
+
+        self.gpu_row_ids = gpu_row_ids
+        self.miss_mask = ((gpu_row_ids < 0) & host_rows).int()
         self.gpu_source_key = source_key
 
 
@@ -632,8 +751,28 @@ def build_hisparse_prefill_staging_plan(
     seq_lens: torch.Tensor,
     block_size: int,
     staging_block_capacity: int,
+    *,
+    dcp_size: int = 1,
+    dcp_rank: int | None = None,
+    interleave: int = 1,
 ) -> HiSparsePrefillStagingPlan:
-    """Build an asynchronous layer-independent host-cache staging remap."""
+    """Build a fixed-capacity staging remap over live rank-local host rows.
+
+    The caller sizes capacity from an upper bound on the rank's active pages.
+    """
+    if dcp_size < 1:
+        raise ValueError("Invalid HiSparse DCP staging group or interleave.")
+    if dcp_size > 1:
+        if (
+            dcp_rank is None
+            or not 0 <= dcp_rank < dcp_size
+            or interleave < 1
+            or block_size % interleave
+        ):
+            raise ValueError("Invalid HiSparse DCP staging group or interleave.")
+        from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+
+        seq_lens = get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, interleave)
     device = block_table.device
     used = (seq_lens.to(torch.int64) + block_size - 1) // block_size
     packed_offsets = torch.arange(staging_block_capacity, device=device)
@@ -649,6 +788,19 @@ def build_hisparse_prefill_staging_plan(
     )
     referenced = torch.where(valid, block_table.flatten()[flat_positions], 0)
     referenced_bt, row_ids = hisparse_prefill_staging_remap(referenced, block_size)
+    if dcp_size > 1:
+        # Multiple requests can reference the same native host ID. Retain the
+        # largest live extent, including an incomplete final DCP stripe.
+        # Null and unreferenced pages have no source rows.
+        live = (seq_lens[rows] - columns * block_size).clamp(0, block_size)
+        live = torch.where(valid & (referenced > 0), live, 0).to(torch.int32)
+        page_extents = row_ids.new_zeros(row_ids.numel() // block_size)
+        page_extents.scatter_reduce_(
+            0, referenced_bt.to(torch.int64), live, reduce="amax"
+        )
+        offsets = torch.arange(block_size, device=device, dtype=torch.int32)
+        owned = (offsets < page_extents[:, None]).view_as(row_ids)
+        row_ids = torch.where(owned, row_ids, -1)
     scratch_index = block_table.numel()
     scatter_positions = torch.where(valid, flat_positions, scratch_index)
     remapped = torch.where(valid, referenced_bt.flatten(), 0)
@@ -666,6 +818,104 @@ def build_hisparse_prefill_staging_plan(
         miss_mask=valid_rows.to(torch.int32),
         block_size=block_size,
     )
+
+
+@dataclass(frozen=True)
+class HiSparseDCPDecodeMetadata:
+    """Decode bounds over the device's actual verification layout."""
+
+    query_start_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    size: int
+    rank: int
+    interleave: int
+
+    @classmethod
+    def from_common(
+        cls,
+        common: CommonAttentionMetadata,
+        num_decodes: int,
+        *,
+        size: int,
+        rank: int,
+        interleave: int,
+    ) -> HiSparseDCPDecodeMetadata:
+        if not 0 < num_decodes <= common.num_reqs:
+            raise ValueError("HiSparse DCP requires at least one decode request.")
+        return cls(
+            common.query_start_loc[: num_decodes + 1],
+            common.seq_lens[:num_decodes],
+            size,
+            rank,
+            interleave,
+        )
+
+    def localize(
+        self, req_ids: torch.Tensor, logical_topk: torch.Tensor
+    ) -> torch.Tensor:
+        """Map each owned, causal global token to a request-local rank row."""
+        from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+
+        num_reqs = self.seq_lens.numel()
+        if (
+            not 0 <= self.rank < self.size
+            or self.size <= 1
+            or self.interleave <= 0
+            or self.query_start_loc.shape != (num_reqs + 1,)
+            or self.seq_lens.shape != (num_reqs,)
+            or num_reqs == 0
+            or req_ids.ndim != 1
+            or logical_topk.ndim != 2
+            or logical_topk.shape[1] == 0
+            or req_ids.numel() < logical_topk.shape[0]
+            or logical_topk.dtype != torch.int32
+        ):
+            raise ValueError("Invalid HiSparse DCP decode metadata.")
+
+        num_rows = logical_topk.shape[0]
+        lane = torch.arange(num_rows, device=logical_topk.device, dtype=torch.int32)
+        req_ids = req_ids[:num_rows]
+        valid_req = (req_ids >= 0) & (req_ids < num_reqs)
+        safe_req = req_ids.clamp(0, num_reqs - 1).long()
+        start = self.query_start_loc[safe_req]
+        end = self.query_start_loc[safe_req + 1]
+        seq_len = self.seq_lens[safe_req]
+        active = valid_req & (lane >= start) & (lane < end) & (seq_len >= end - start)
+        # A verification query can attend up to its own token only. FULL
+        # graphs may include stale request IDs beyond the exact device split.
+        visible = seq_len - end + lane
+        owned = logical_topk // self.interleave % self.size == self.rank
+        valid = (
+            active[:, None]
+            & owned
+            & (logical_topk >= 0)
+            & (logical_topk <= visible[:, None])
+        )
+        local = get_dcp_local_seq_lens(
+            logical_topk, self.size, self.rank, self.interleave
+        )
+        return torch.where(valid, local, -1).contiguous()
+
+
+def _compact_hisparse_dcp_decode_topk_(
+    physical_rows: torch.Tensor, valid_counts: torch.Tensor | None
+) -> None:
+    # Null and unallocated slots can vanish during residency resolution.
+    # Use the sparse remap's stable single-tile prefix-sum rule on its output
+    # without interpreting the already-physical row IDs again.
+    width = physical_rows.shape[1]
+    valid = physical_rows >= 0
+    prefix = torch.cumsum(valid, dim=1, dtype=torch.int64)
+    counts = prefix[:, -1:]
+    columns = torch.arange(width, device=physical_rows.device)
+    # Give each invalid lane a distinct position in the tail, avoiding a
+    # shared scatter destination on ranks with little or no valid work.
+    destination = torch.where(valid, prefix - 1, counts + columns - prefix)
+    packed = torch.empty_like(physical_rows)
+    packed.scatter_(1, destination, torch.where(valid, physical_rows, -1))
+    physical_rows.copy_(packed)
+    if valid_counts is not None:
+        valid_counts.copy_(counts.squeeze(1))
 
 
 def _has_hisparse_ops() -> bool:
@@ -985,6 +1235,7 @@ class HiSparseRuntime:
         shared_rows: slice,
         attention_indices_out: torch.Tensor | None = None,
         valid_counts_out: torch.Tensor | None = None,
+        dcp_decode: HiSparseDCPDecodeMetadata | None = None,
     ) -> None:
         """Resolve logical top-k positions and compact rows requiring swaps."""
         num_tokens = topk_indices.shape[0]
@@ -1013,6 +1264,9 @@ class HiSparseRuntime:
         swap_device_physical_rows = shared.swap_device_physical_rows[shared_rows]
         swap_counts = shared.swap_counts[shared_rows]
 
+        if dcp_decode is not None:
+            topk_indices = dcp_decode.localize(req_id_per_token, topk_indices)
+            num_valid_rows = dcp_decode.query_start_loc[-1:]
         # Rows past num_valid_rows and rows without request state come out as
         # -1 so the attention kernel masks them.
         self.cache_ops.hisparse_resolve_residency(
@@ -1042,6 +1296,8 @@ class HiSparseRuntime:
             else 0,
             num_valid_rows,
         )
+        if dcp_decode is not None:
+            _compact_hisparse_dcp_decode_topk_(physical_topk_indices, valid_topk_counts)
 
     def _swap_rows(self, shared_rows: slice) -> None:
         hot = self.hot
@@ -1067,6 +1323,7 @@ class HiSparseRuntime:
         attention_indices_out: torch.Tensor | None,
         valid_counts_out: torch.Tensor | None,
         num_valid_rows: torch.Tensor,
+        dcp_decode: HiSparseDCPDecodeMetadata | None = None,
     ) -> None:
         group = self.index_group
         compute_stream = torch.accelerator.current_stream()
@@ -1086,6 +1343,7 @@ class HiSparseRuntime:
                 shared_rows=shared_rows,
                 attention_indices_out=attention_indices_out,
                 valid_counts_out=valid_counts_out,
+                dcp_decode=dcp_decode,
             )
             runtimes = [self]
             if resident.prefetch_decode_group:
@@ -1126,6 +1384,7 @@ class HiSparseRuntime:
         return_valid_counts: bool = False,
         attention_indices_out: torch.Tensor | None = None,
         valid_counts_out: torch.Tensor | None = None,
+        dcp_decode: HiSparseDCPDecodeMetadata | None = None,
     ) -> HiSparseTopKResult:
         """Resolve once per group and ensure this layer's rows are available."""
         num_tokens = logical_topk_indices.shape[0]
@@ -1146,6 +1405,7 @@ class HiSparseRuntime:
                 shared_rows=shared_rows,
                 attention_indices_out=attention_indices_out,
                 valid_counts_out=valid_counts_out,
+                dcp_decode=dcp_decode,
                 num_valid_rows=num_valid_rows,
             )
 
@@ -1339,13 +1599,29 @@ class HiSparseCacheHandle:
         self.slot_mapping = slot_mapping
 
     def ensure_prefill_gpu_sources(
-        self, plan: HiSparsePrefillStagingPlan, num_decodes: int
+        self,
+        plan: HiSparsePrefillStagingPlan,
+        num_decodes: int,
+        *,
+        num_decode_tokens: int = 0,
     ) -> None:
         assert self.view is not None and self.block_table is not None
         state_indices = self.runtime.request_state_indices
         assert state_indices is not None
+        writer_slots = None
+        if plan.writer_rows is not None:
+            if self.slot_mapping is None:
+                raise RuntimeError(
+                    "HiSparse prefill resident writer slots are missing."
+                )
+            end = num_decode_tokens + plan.writer_rows.numel()
+            writer_slots = self.slot_mapping[num_decode_tokens:end]
         plan.ensure_gpu_sources(
-            self.block_table, state_indices[num_decodes:], self.view.block_size
+            self.block_table,
+            state_indices[num_decodes:],
+            self.view.block_size,
+            writer_slots=writer_slots,
+            resident_num_blocks=self.view.cache.shape[0],
         )
 
     def stage_prefill_rows(
@@ -1353,11 +1629,17 @@ class HiSparseCacheHandle:
         source_cache: torch.Tensor,
         plan: HiSparsePrefillStagingPlan,
         num_decodes: int,
+        *,
+        num_decode_tokens: int = 0,
     ) -> torch.Tensor:
         resident_cache = None
         if self.view is not None and self.block_table is not None:
-            self.ensure_prefill_gpu_sources(plan, num_decodes)
+            self.ensure_prefill_gpu_sources(
+                plan, num_decodes, num_decode_tokens=num_decode_tokens
+            )
             resident_cache = self.view.cache
+        elif plan.writer_rows is not None:
+            raise RuntimeError("HiSparse prefill resident cache is missing.")
         return self.runtime.gather_prefill_cache(
             source_cache, plan, resident_cache=resident_cache
         )
@@ -1373,6 +1655,7 @@ class HiSparseCacheHandle:
         return_valid_counts: bool = False,
         attention_indices_out: torch.Tensor | None = None,
         valid_counts_out: torch.Tensor | None = None,
+        dcp_decode: HiSparseDCPDecodeMetadata | None = None,
     ) -> HiSparseTopKResult:
         return self.runtime.swap_in(
             resident=self,
@@ -1384,6 +1667,7 @@ class HiSparseCacheHandle:
             attention_indices_out=attention_indices_out,
             valid_counts_out=valid_counts_out,
             num_valid_rows=num_valid_rows,
+            dcp_decode=dcp_decode,
         )
 
 

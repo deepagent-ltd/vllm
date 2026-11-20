@@ -13,12 +13,14 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseMetadata,
+    _finish_dcp_partials,
     _get_workspace_buffer,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
     triton_convert_req_index_to_global_index,
+    triton_filter_and_convert_dcp_index,
 )
 
 if TYPE_CHECKING:
@@ -36,6 +38,8 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
 
     is_sparse = True
     supports_dense_mha_prefill = False
+    can_return_lse_for_decode = True
+    lse_base_on_e = False
 
     def get_fp8_ds_mla_row_bytes(self) -> int:
         if self.kv_lora_rank == 512 and self.qk_rope_head_dim == 0:
@@ -118,6 +122,14 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
+
+        if self.dcp_world_size > 1:
+            index_group = self.index_group
+            if not isinstance(index_group, HiSparseMLAIndexGroup):
+                raise NotImplementedError("SM120 sparse DCP requires HiSparse.")
+            return self._forward_hisparse_dcp_mqa(
+                q, kv_c_and_k_pe_cache, attn_metadata, index_group
+            )
 
         num_actual_toks = q.shape[0]
 
@@ -214,16 +226,112 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
             None,
         )
 
+    def _forward_hisparse_dcp_mqa(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        metadata: FlashInferMLASparseMetadata,
+        index_group: HiSparseMLAIndexGroup,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute rank-local partials for the existing MLA DCP reduction."""
+        assert self.topk_indices_buffer is not None
+        start = metadata.topk_start
+        num_tokens = q.shape[0]
+        num_decode = metadata.num_decode_tokens
+        topk = self.topk_indices_buffer[start : start + num_tokens]
+        block_size = metadata.block_size
+
+        decode = None
+        if num_decode:
+            if metadata.hisparse_dcp_decode is None:
+                raise ValueError("Missing rank-local HiSparse decode metadata.")
+            physical, counts = index_group.convert_logical_to_physical_topk(
+                self.index_group_index,
+                topk[:num_decode],
+                metadata,
+                block_stride_rows=None,
+                return_valid_counts=True,
+            )
+            decode = self._run_dcp_mqa_kernel(
+                q[:num_decode],
+                index_group.physical_kv_cache(self.index_group_index),
+                physical,
+                counts,
+                block_size,
+            )
+            if num_decode == num_tokens:
+                return decode
+
+        plan = metadata.hisparse_prefill_plan
+        if plan is None or plan.query_context_lens is None:
+            raise ValueError("Missing causal HiSparse prefill metadata.")
+        staged, block_table, req_ids = index_group.stage_prefill_rows(
+            self.index_group_index, kv_cache, metadata
+        )
+        prefill_topk = topk[num_decode:]
+        _, block_stride_rows = flat_kv_row_view(staged, block_size)
+        if plan.writer_rows is None:
+            # Synthetic batches have no live KV. In particular, the null page
+            # in a staged block table must not become a real attention input.
+            prefill_topk = torch.full_like(prefill_topk, -1)
+        else:
+            prefill_topk = prefill_topk.masked_fill(
+                prefill_topk >= plan.query_context_lens[:, None], -1
+            )
+        physical, counts = triton_filter_and_convert_dcp_index(
+            req_ids,
+            block_table,
+            prefill_topk,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=metadata.cp_kv_cache_interleave_size,
+            BLOCK_SIZE=block_size,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            NUM_TOPK_TOKENS=topk.shape[1],
+            return_valid_counts=True,
+        )
+        prefill = self._run_dcp_mqa_kernel(
+            q[num_decode:], staged, physical, counts, block_size
+        )
+        if decode is None:
+            return prefill
+        return torch.cat((decode[0], prefill[0])), torch.cat((decode[1], prefill[1]))
+
+    def _run_dcp_mqa_kernel(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        physical_topk: torch.Tensor,
+        valid_counts: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # FlashInfer sees rank-local physical rows and the gathered query heads.
+        rows, _ = flat_kv_row_view(kv_cache, block_size)
+        lse = q.new_empty(q.shape[:2], dtype=torch.float32)
+        out = self._run_mqa_kernel(
+            q,
+            rows.view(-1, 64, rows.shape[-1]),
+            physical_topk,
+            valid_counts=valid_counts,
+            lse=lse,
+        )
+        _finish_dcp_partials(out, lse, valid_counts)
+        return out, lse
+
     def _run_mqa_kernel(
         self,
         q: torch.Tensor,
         kv_cache: torch.Tensor,
         topk_indices_physical: torch.Tensor,
+        *,
+        valid_counts: torch.Tensor | None = None,
+        lse: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_actual_toks = q.shape[0]
+        num_heads = self.num_heads if lse is None else q.shape[1]
 
         output = q.new_empty(
-            (num_actual_toks, self.num_heads, self.kv_lora_rank),
+            (num_actual_toks, num_heads, self.kv_lora_rank),
             dtype=q.dtype,
         )
 
@@ -235,6 +343,16 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
         )
 
         sparse_capacity = topk_indices_physical.shape[1]
+        lse_args = (
+            {}
+            if lse is None
+            else {
+                "backend": "sparse",
+                "lse": lse,
+                "return_lse": True,
+                "return_lse_base": "base2",
+            }
+        )
         out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
             query=q.unsqueeze(1),
             kv_cache=kv_cache.view(torch.uint8).unsqueeze(1),
@@ -243,12 +361,15 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=topk_indices_physical.unsqueeze(1),
-            seq_lens=None,
+            seq_lens=valid_counts,
             max_seq_len=sparse_capacity,
             out=output.unsqueeze(1),
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
             sparse_mla_top_k=sparse_capacity,
             kv_scale_format=self.kv_scale_format,
+            **lse_args,
         )
+        if lse is not None:
+            out, _ = out
         return out.squeeze(1)
