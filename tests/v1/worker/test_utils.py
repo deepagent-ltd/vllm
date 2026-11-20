@@ -472,7 +472,7 @@ def test_shared_host_pool_registers_layer_spans_in_one_backing(monkeypatch):
             ),
         ],
     )
-    vllm_config = SimpleNamespace()
+    vllm_config = SimpleNamespace(kv_transfer_config=None)
     pool = hisparse_runtime_module.HiSparseHostPool(vllm_config, config)
     backing = pool.allocate(44)
     allocate.assert_called_once_with(vllm_config, [12, 12, 20], 4, 16)

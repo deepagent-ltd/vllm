@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp,
     KVConnectorBase_V1,
+    KVConnectorControlHandler,
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
@@ -218,6 +219,16 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     @property
     def sub_connectors(self) -> list[KVConnectorBase_V1]:
         return list(self._connectors)
+
+    def get_control_handler(self, namespace: str) -> KVConnectorControlHandler | None:
+        handler = None
+        for connector in self._connectors:
+            candidate = connector.get_control_handler(namespace)
+            if candidate is not None:
+                if handler is not None:
+                    raise ValueError("Multiple connectors own this control namespace")
+                handler = candidate
+        return handler
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import mmap
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -14,11 +15,13 @@ import psutil
 import torch
 
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config.kv_transfer import hisparse_connector_extra_config
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context, in_piecewise_cudagraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.host_memory import host_registration_ranges
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -230,6 +233,20 @@ def pin_tensor(tensor: torch.Tensor) -> None:
     get_hisparse_backend().pin_tensor(tensor)
 
 
+@dataclass(frozen=True)
+class HiSparseHostMemoryLease:
+    """Unregistered, exclusive backing owned by an external allocator.
+
+    The buffer is one page-aligned CPU int8 vector. Release relinquishes the
+    worker's ownership after device synchronization and host unregister.
+    The backing must stay valid and exclusive until its last storage alias dies.
+    Release must be idempotent so teardown can retry if cleanup raises.
+    """
+
+    buffer: torch.Tensor
+    release: Callable[[], None]
+
+
 class HiSparseHostPool:
     """Keep the single host backing and its exact registration range."""
 
@@ -240,11 +257,89 @@ class HiSparseHostPool:
         self.registered: torch.Tensor | None = None
         self.shared_region: SharedOffloadRegion | None = None
         self.pinned: list[torch.Tensor] = []
+        self.external_lease: HiSparseHostMemoryLease | None = None
+        self._retiring = False
+
+    def _allocate_external(self, size: int, allocator_path: str) -> torch.Tensor:
+        parallel = self.vllm_config.parallel_config
+        if self.kv_cache_config.hisparse_shared_host_pool or (
+            parallel.tensor_parallel_size,
+            parallel.pipeline_parallel_size,
+            parallel.prefill_context_parallel_size,
+            parallel.decode_context_parallel_size,
+        ) != (1, 1, 1, 1):
+            raise ValueError(
+                "An external HiSparse host allocator requires TP1/PP1/PCP1/DCP1."
+            )
+        if (
+            not isinstance(allocator_path, str)
+            or "." not in allocator_path
+            or not all(part.isidentifier() for part in allocator_path.split("."))
+        ):
+            raise ValueError("host_pool_allocator must be a qualified Python name.")
+        if size <= 0:
+            raise ValueError("HiSparse host allocation size must be positive.")
+        allocator = resolve_obj_by_qualname(allocator_path)
+        if not callable(allocator):
+            raise TypeError("HiSparse host allocator must be callable.")
+        registered_size = round_up(size, mmap.PAGESIZE)
+        lease = allocator(
+            instance_id=self.vllm_config.instance_id,
+            dp_rank=parallel.data_parallel_index,
+            size_bytes=registered_size,
+        )
+        if not isinstance(lease, HiSparseHostMemoryLease):
+            raise TypeError("External allocator must return HiSparseHostMemoryLease.")
+        return self._register_external_lease(size, lease)
+
+    def _register_external_lease(
+        self, size: int, lease: HiSparseHostMemoryLease
+    ) -> torch.Tensor:
+        if not callable(lease.release):
+            raise TypeError("HiSparse host lease release must be callable.")
+        registered_size = round_up(size, mmap.PAGESIZE)
+        try:
+            buffer = lease.buffer
+            if (
+                not isinstance(buffer, torch.Tensor)
+                or buffer.device.type != "cpu"
+                or buffer.dtype != torch.int8
+                or buffer.shape != (registered_size,)
+                or not buffer.is_contiguous()
+                or buffer.data_ptr() % mmap.PAGESIZE != 0
+            ):
+                raise ValueError(
+                    "External HiSparse backing must be a page-aligned CPU int8 "
+                    "vector with the requested size."
+                )
+            pin_tensor(buffer)
+        except Exception:
+            try:
+                lease.release()
+            except Exception:
+                self.external_lease = lease
+                self._retiring = True
+                logger.exception("HiSparse host allocator cleanup failed")
+            raise
+        self.external_lease = lease
+        self.pinned = [buffer]
+        self.registered = buffer
+        self.backing = buffer[:size]
+        return self.backing
 
     def allocate(self, size: int) -> torch.Tensor:
+        if self._retiring:
+            raise RuntimeError("HiSparse host pool is retiring.")
         if self.backing is not None:
             assert self.backing.numel() == size, "HiSparse host pool size changed."
             return self.backing
+        extra_config = hisparse_connector_extra_config(
+            self.vllm_config.kv_transfer_config
+        )
+        allocator_path = (extra_config or {}).get("host_pool_allocator")
+        if allocator_path is not None:
+            return self._allocate_external(size, allocator_path)
+
         config = self.kv_cache_config
         if config.hisparse_shared_host_pool:
             tensor_sizes = [
@@ -287,7 +382,20 @@ def get_hisparse_host_pool(
 
 
 def drop_hisparse_host_pool(vllm_config: VllmConfig) -> None:
-    _host_pools.pop(vllm_config.instance_id, None)
+    instance_id = vllm_config.instance_id
+    pool = _host_pools.get(instance_id)
+    if pool is not None and pool.external_lease is not None:
+        pool._retiring = True
+        if pool.pinned:
+            # Device synchronization or unregister failed. Keep the lease and
+            # let process exit reclaim registered memory.
+            return
+        pool.backing = None
+        pool.registered = None
+        # A failed release leaves the retiring pool available for retry.
+        pool.external_lease.release()
+        pool.external_lease = None
+    _host_pools.pop(instance_id, None)
 
 
 def use_shared_hisparse_host_pool(vllm_config: VllmConfig) -> bool:

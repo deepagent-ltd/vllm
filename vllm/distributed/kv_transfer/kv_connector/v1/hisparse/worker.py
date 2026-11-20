@@ -245,14 +245,19 @@ class HiSparseConnectorWorker:
                 shared_host_region=shared_host_region,
                 is_host_writer=is_host_writer,
             )
-        except Exception:
+        except Exception as init_error:
             release_pinned_state(
                 pinned_host_pools,
                 shared_host_region,
             )
             for cache in cache_handles:
                 cache.unbind_cache()
-            drop_hisparse_host_pool(self.vllm_config)
+            try:
+                drop_hisparse_host_pool(self.vllm_config)
+            except Exception as cleanup_error:
+                init_error.add_note(
+                    f"HiSparse lease cleanup failed during rollback: {cleanup_error!r}"
+                )
             raise
 
     def initialize(

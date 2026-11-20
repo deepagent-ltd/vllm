@@ -1337,6 +1337,20 @@ class AsyncMPClient(MPClient):
     async def call_utility_async(self, method: str, *args) -> Any:
         return await self._call_utility_async(method, *args, engine=self.core_engine)
 
+    async def kv_connector_control_async(
+        self, namespace: str, operation: str, payload: dict[str, Any]
+    ) -> Any:
+        """Call a connector utility on a single explicitly bound engine core."""
+        if len(self.core_engines) != 1:
+            raise ValueError("KV connector control requires a single-core client")
+        return await self._call_utility_async(
+            "kv_connector_control",
+            namespace,
+            operation,
+            payload,
+            engine=self.core_engines[0],
+        )
+
     async def call_utility_all_async(self, method: str, *args) -> list[Any]:
         # Like the Rust client's call_utility: one result per managed engine.
         return await asyncio.gather(
